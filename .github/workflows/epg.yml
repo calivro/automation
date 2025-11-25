@@ -1,0 +1,312 @@
+name: EPG Grabber
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */4 * * *"
+    - cron: "00 22 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: epg-grabber-main
+  cancel-in-progress: true
+
+jobs:
+  run-epg:
+    runs-on: ubuntu-latest
+    env:
+      EPG_REPO_NAME: ${{ secrets.EPG_REPO_NAME }}     # e.g. "calivro/tvguide"
+      EPG_REPO_PAT: ${{ secrets.EPG_REPO_PAT }}       # PAT with repo scope
+      EPG_JIO_URL: ${{ secrets.EPG_JIO_URL }}
+      TZ: Asia/Kolkata
+
+    steps:
+      # ---------------------------
+      # CHECKOUT REPO (actions/checkout outputs are normal)
+      # ---------------------------
+      - name: Checkout private EPG repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.EPG_REPO_NAME }}
+          ref: main
+          token: ${{ env.EPG_REPO_PAT }}
+          path: epg-repo
+
+      - name: Configure Git
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "GitHub Actions Bot"
+
+      # ---------------------------
+      # SETUP (these 'uses:' steps will have their usual action output)
+      # ---------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.4
+          extensions: xml, imagick, zip, curl
+
+      - name: Install 7-Zip
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+
+      # ---------------------------
+      # SILENT npm install
+      # ---------------------------
+      - name: Install Node.js dependencies (silent)
+        working-directory: epg-repo
+        run: |
+          set -euo pipefail
+          mkdir -p temp_epg
+          LOG=temp_epg/npm_install.log
+          if ! npm install --legacy-peer-deps >"$LOG" 2>&1; then
+            echo "❌ npm install failed — dumping log:"
+            tail -n 500 "$LOG" || true
+            exit 1
+          fi
+          rm -rf temp_epg
+          echo "✔ npm install completed."
+
+      # ---------------------------
+      # SILENT pip install
+      # ---------------------------
+      - name: Install Python dependencies (silent)
+        working-directory: epg-repo
+        run: |
+          set -euo pipefail
+          mkdir -p temp_epg
+          LOG=temp_epg/pip_install.log
+          if [ -f "requirements.txt" ]; then
+            if ! python -m pip install --upgrade pip >"$LOG" 2>&1; then
+              echo "❌ pip upgrade failed — dumping log:"; tail -n 500 "$LOG" || true; exit 1
+            fi
+            if ! pip install --no-cache-dir -r requirements.txt >>"$LOG" 2>&1; then
+              echo "❌ pip install failed — dumping log:"; tail -n 500 "$LOG" || true; exit 1
+            fi
+          fi
+          rm -rf temp_epg
+          echo "✔ pip install completed."
+
+      # ---------------------------
+      # NODE XML GRABS (small stdout allowed per provider; kept minimal)
+      # ---------------------------
+      - name: Grab all EPGs in parallel (silent per provider)
+        working-directory: epg-repo
+        run: |
+          set -euo pipefail
+          mkdir -p tmp_xml temp_epg
+          GRAB_LOG=temp_epg/grab_summary.log
+          : > "$GRAB_LOG"
+
+          grab_provider() {
+            PROVIDER_PATH="$1"
+            BASENAME=$(basename "$PROVIDER_PATH" .xml)
+            OUTFILE="tmp_xml/${BASENAME}.xml"
+            mkdir -p tmp_xml
+            LOG=temp_epg/grab_${BASENAME}.log
+
+            if [ -f "sites/$PROVIDER_PATH" ]; then
+              if ! npm run grab -- --channels="sites/$PROVIDER_PATH" --maxConnections=10 --days=2 --output="$OUTFILE" >"$LOG" 2>&1; then
+                echo "[$BASENAME] ❌ Failed — placeholder" >>"$GRAB_LOG"
+                echo "<?xml version='1.0' encoding='UTF-8'?><tv></tv>" > "$OUTFILE"
+              else
+                echo "[$BASENAME] ✅ Success" >>"$GRAB_LOG"
+              fi
+            else
+              echo "[$BASENAME] ⚠️ Missing channels — placeholder" >>"$GRAB_LOG"
+              echo "<?xml version='1.0' encoding='UTF-8'?><tv></tv>" > "$OUTFILE"
+            fi
+          }
+
+          while read -r PROVIDER_PATH || [ -n "$PROVIDER_PATH" ]; do
+            grab_provider "$PROVIDER_PATH" &
+          done < scripts/epg/sites.txt
+          wait
+
+          # On failure of any provider we will surface logs when merging if needed.
+          echo "✔ grabs completed (details in temp_epg/* if needed)."
+
+      # ---------------------------
+      # SILENT MERGER
+      # ---------------------------
+      - name: Merge EPGs (silent; show logs only on error)
+        working-directory: epg-repo
+        run: |
+          set -euo pipefail
+          mkdir -p temp_epg tmp_xml public/guide
+          MERGE_STDOUT=temp_epg/merge_stdout.log
+          MERGE_STDERR=temp_epg/merge_stderr.log
+
+          if ! python3 -u scripts/epg/epg_grabber.py >"$MERGE_STDOUT" 2>"$MERGE_STDERR"; then
+            echo "❌ EPG merge failed — dumping logs:"
+            echo "---- STDOUT ----"; tail -n 500 "$MERGE_STDOUT" || true
+            echo "---- STDERR ----"; tail -n 500 "$MERGE_STDERR" || true
+            # print per-provider grab logs for context
+            echo "---- per-provider logs (last 200 lines each) ----"
+            for f in temp_epg/grab_*.log; do
+              [ -f "$f" ] || continue
+              echo "== $f =="; tail -n 200 "$f" || true
+            done
+            exit 1
+          fi
+
+          if [ ! -s public/guide/guide.xml.gz ]; then
+            echo "⚠️ Missing output: public/guide/guide.xml.gz"
+            tail -n 500 "$MERGE_STDOUT" || true
+            tail -n 500 "$MERGE_STDERR" || true
+            exit 1
+          fi
+
+          rm -rf temp_epg || true
+          echo "✅ EPG merge completed."
+
+      # ---------------------------
+      # SILENT NIGHTLY EPG DOWNLOADER
+      # ---------------------------
+      - name: EPG Downloader (silent; show logs only on error)
+        if: github.event.schedule == '00 22 * * *'
+        working-directory: epg-repo
+        env:
+          EPG_JIO_URL: ${{ secrets.EPG_JIO_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p temp_epg public/guide
+          DL_STDOUT=temp_epg/epg_downloader_stdout.log
+          DL_STDERR=temp_epg/epg_downloader_stderr.log
+
+          if ! python3 -u scripts/epg/epg_downloader.py >"$DL_STDOUT" 2>"$DL_STDERR"; then
+            echo "❌ EPG downloader failed — dumping logs:"
+            tail -n 500 "$DL_STDOUT" || true
+            tail -n 500 "$DL_STDERR" || true
+            exit 1
+          fi
+
+          OUT=public/guide/jiotv.xml.gz
+          if [ ! -s "$OUT" ]; then
+            echo "⚠️ Missing output: $OUT"
+            tail -n 500 "$DL_STDOUT" || true
+            tail -n 500 "$DL_STDERR" || true
+            exit 1
+          fi
+
+          rm -rf temp_epg || true
+          echo "✅ EPG downloader completed."
+
+      # ---------------------------
+      # SILENT TEMPEST PHP GRABBER
+      # ---------------------------
+      - name: Tempest PHP grabber (silent; show logs only on error)
+        working-directory: epg-repo
+        run: |
+          set -euo pipefail
+          mkdir -p temp_epg
+          PHP_LOG=temp_epg/tempest_php.log
+          PY_STDOUT=temp_epg/tempest_py_stdout.log
+          PY_LOG=temp_epg/tempest_epg.log
+
+          if ! 7z x tempest_epg_grabber.zip -otemp_epg >/dev/null 2>&1; then
+            echo "⚠️ No existing temp zip — continuing"
+          fi
+
+          if ! php -d date.timezone=Asia/Kolkata -q temp_epg/tempest.php --epg config=tempest.config.xml >"$PHP_LOG" 2>&1; then
+            echo "❌ Tempest PHP failed — dumping logs:"
+            tail -n 500 "$PHP_LOG" || true
+            [ -f "$PY_LOG" ] && tail -n 500 "$PY_LOG" || true
+            exit 1
+          fi
+
+          if ! python3 -u scripts/epg/tempest_epg.py >"$PY_STDOUT" 2>&1; then
+            echo "❌ Tempest processor failed — dumping logs:"
+            tail -n 500 "$PY_STDOUT" || true
+            [ -f "$PY_LOG" ] && tail -n 500 "$PY_LOG" || true
+            exit 1
+          fi
+
+          rm -f temp_epg/tempest_config/epg/epg.xml || true
+          rm -f tempest_epg_grabber.zip || true
+          7z a -tzip tempest_epg_grabber.zip ./temp_epg/* >/dev/null 2>&1 || true
+
+          rm -rf temp_epg || true
+          echo "✅ Tempest completed."
+
+      # ---------------------------
+      # SILENT MERGE VALIDATION (optional short-check for deterministic gz)
+      # ---------------------------
+      - name: Validate merged outputs (silent)
+        working-directory: epg-repo
+        run: |
+          set -euo pipefail
+          # quick existence checks
+          missing=0
+          for f in public/guide/guide.xml.gz public/guide/epg.xml.gz public/guide/jiotv.xml.gz; do
+            if [ -e "$f" ] && [ -s "$f" ]; then
+              continue
+            else
+              echo "⚠ Missing or empty: $f" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "❌ Validation failed (missing outputs)" >&2
+            # show git status for context
+            git status --porcelain || true
+            exit 1
+          fi
+          echo "✅ Outputs present."
+
+      # ---------------------------
+      # COMMIT & PUSH (silent, retries, no token in logs)
+      # ---------------------------
+      - name: Commit & Push (silent)
+        working-directory: epg-repo
+        run: |
+          set -euo pipefail
+          mkdir -p temp_epg
+          GIT_LOG=temp_epg/git_push.log
+
+          git status --porcelain >"$GIT_LOG" 2>&1 || true
+          git add public/guide/*.xml.gz tempest_epg_grabber.zip >>"$GIT_LOG" 2>&1 || true
+
+          if git diff --cached --quiet; then
+            echo "✅ No changes. Nothing to commit."
+            rm -rf temp_epg || true
+            exit 0
+          fi
+
+          git commit -m "📺 Automatically updated EPG" >>"$GIT_LOG" 2>&1 || true
+
+          # retry push up to 3 times
+          for i in 1 2 3; do
+            if git push origin main >>"$GIT_LOG" 2>&1; then
+              echo "🚀 Push complete!"
+              rm -rf temp_epg || true
+              break
+            else
+              echo "⚠ Push attempt $i failed — retrying..." >>"$GIT_LOG" 2>&1
+              git pull --rebase origin main >>"$GIT_LOG" 2>&1 || true
+              if [ $i -eq 3 ]; then
+                echo "❌ Push failed after 3 attempts — dumping git log:"
+                tail -n 500 "$GIT_LOG" || true
+                exit 1
+              fi
+            fi
+          done
+
+          rm -rf temp_epg || true
+
+      # ---------------------------
+      # FINISH
+      # ---------------------------
+      - name: Done
+        run: echo "✅ Workflow finished."
