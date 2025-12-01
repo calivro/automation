@@ -24,7 +24,7 @@ jobs:
 
     steps:
       # -------------------------
-      # Checkout repo
+      # Checkout Private Repo
       - name: Checkout Private Repo
         uses: actions/checkout@v4
         with:
@@ -39,7 +39,7 @@ jobs:
           python-version: "3.x"
 
       # -------------------------
-      # Cache pip
+      # Cache pip dependencies
       - name: Cache pip
         uses: actions/cache@v3
         with:
@@ -49,7 +49,7 @@ jobs:
             ${{ runner.os }}-pip-
 
       # -------------------------
-      # Install dependencies
+      # Install Python requirements
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -60,11 +60,11 @@ jobs:
         run: pip list
 
       # -------------------------
-      # Update playlists + LIVE checker
+      # Update All Playlists + LIVE Checker
       - name: Update Playlists & Run LIVE Playlist Checker
         shell: bash
         env:
-          # Existing playlists
+          # Input/output URLs from secrets
           FANCODE_INPUT_PATH: ${{ secrets.FANCODE_INPUT_PATH }}
           FANCODE_OUTPUT_PATH: ${{ secrets.FANCODE_OUTPUT_PATH }}
           FANCODE_URL: ${{ secrets.FANCODE_URL }}
@@ -89,7 +89,7 @@ jobs:
           ZEE5_OUTPUT_PATH: ${{ secrets.ZEE5_OUTPUT_PATH }}
           ZEE5_URL: ${{ secrets.ZEE5_URL }}
 
-          # LIVE Playlist checker envs
+          # LIVE Playlist processing
           LIVE_INPUT_PATH: ${{ secrets.LIVE_INPUT_PATH }}
           LIVE_OUTPUT_PATH: ${{ secrets.LIVE_OUTPUT_PATH }}
           LIVE_LOG_PATH: ${{ secrets.LIVE_LOG_PATH }}
@@ -110,11 +110,12 @@ jobs:
           echo -e "${GREEN}🕒 Current minute: $MINUTE${NC}"
 
           # -------------------------
-          # Loop through normal playlists
+          # Update ALL normal playlists
           while IFS='|' read -r NAME INPUT_SECRET OUTPUT_SECRET URL_SECRET INTERVAL; do
             [[ -z "$NAME" ]] && continue
             [[ -z "$INTERVAL" ]] && INTERVAL=0
 
+            # Run only on correct intervals
             if (( INTERVAL > 0 && (INTERVAL == 15 || 10#$MINUTE % INTERVAL == 0) )); then
               echo -e "${GREEN}⏰ Updating $NAME...${NC}"
               if ! python scripts/update_${NAME,,}.py; then
@@ -125,9 +126,11 @@ jobs:
               echo -e "${YELLOW}⏩ Skipping $NAME this run${NC}"
             fi
 
+            # Check for updated files
             if [[ -n "$OUTPUT_SECRET" ]]; then
               OUTPUT_PATH="${!OUTPUT_SECRET}"
-              if [ -f "$OUTPUT_PATH" ]; then
+
+              if [[ -f "$OUTPUT_PATH" ]]; then
                 git add "$OUTPUT_PATH"
                 if ! git diff --cached --quiet "$OUTPUT_PATH"; then
                   CHANGED_PLAYLISTS+=("$NAME")
@@ -144,30 +147,34 @@ jobs:
           done <<< "$PLAYLISTS"
 
           # -------------------------
-          # Run LIVE Checker
+          # RUN LIVE PLAYLIST CHECKER
           echo -e "${GREEN}🔍 Running LIVE Playlist Checker...${NC}"
           if ! python scripts/check_playlist.py; then
             echo -e "${RED}⚠ LIVE Playlist Checker failed, skipping.${NC}"
           fi
 
           # -------------------------
-          # Folder-based LIVE output detection
+          # FIXED: LIVE folder-based staging (100% reliable)
           if [[ -d "$LIVE_OUTPUT_PATH" ]]; then
-            git add "$LIVE_OUTPUT_PATH"/*.m3u "$LIVE_OUTPUT_PATH"/*.m3u8 2>/dev/null || true
 
-            if ! git diff --cached --quiet "$LIVE_OUTPUT_PATH"; then
+            # Add whole folder (safe for masked paths)
+            git add "$LIVE_OUTPUT_PATH" 2>/dev/null || true
+
+            # Check if ANY file is staged
+            if ! git diff --cached --quiet; then
               CHANGED_PLAYLISTS+=("LIVE")
               echo -e "${GREEN}✅ LIVE playlist folder updated.${NC}"
             else
               echo -e "${YELLOW}⚪ LIVE playlist unchanged.${NC}"
               git restore --staged "$LIVE_OUTPUT_PATH" || true
             fi
+
           else
             echo -e "${RED}⚠ LIVE output folder does not exist: $LIVE_OUTPUT_PATH${NC}"
           fi
 
           # -------------------------
-          # Commit & push
+          # COMMIT & PUSH
           if [ ${#CHANGED_PLAYLISTS[@]} -ne 0 ]; then
             git commit -m "🔄 Auto-update playlists: ${CHANGED_PLAYLISTS[*]}" || echo "No changes to commit"
             git push origin main
