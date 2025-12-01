@@ -2,7 +2,7 @@ name: Playlist Fetcher
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # Runs every 15 minutes
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 concurrency:
@@ -21,7 +21,7 @@ jobs:
         SkySport|SKYSPORT_INPUT_PATH|SKYSPORT_OUTPUT_PATH|SKYSPORT_URL|15
         SonyLIV|SONYLIV_INPUT_PATH|SONYLIV_OUTPUT_PATH|SONYLIV_URL|15
         Zee5|ZEE5_INPUT_PATH|ZEE5_OUTPUT_PATH|ZEE5_URL|15
-        
+
     steps:
       # -------------------------
       # Checkout repo
@@ -39,7 +39,7 @@ jobs:
           python-version: "3.x"
 
       # -------------------------
-      # Cache Python dependencies
+      # Cache pip
       - name: Cache pip
         uses: actions/cache@v3
         with:
@@ -49,22 +49,22 @@ jobs:
             ${{ runner.os }}-pip-
 
       # -------------------------
-      # Install dependencies (ensure tqdm installed)
+      # Install dependencies
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install --no-cache-dir -r requirements.txt
           pip install --no-cache-dir tqdm --upgrade
+
       - name: Verify installed Python packages
         run: pip list
 
       # -------------------------
-      # Update playlists and LIVE playlist
+      # Update playlists + LIVE checker
       - name: Update Playlists & Run LIVE Playlist Checker
         shell: bash
         env:
           # Existing playlists
-
           FANCODE_INPUT_PATH: ${{ secrets.FANCODE_INPUT_PATH }}
           FANCODE_OUTPUT_PATH: ${{ secrets.FANCODE_OUTPUT_PATH }}
           FANCODE_URL: ${{ secrets.FANCODE_URL }}
@@ -89,6 +89,7 @@ jobs:
           ZEE5_OUTPUT_PATH: ${{ secrets.ZEE5_OUTPUT_PATH }}
           ZEE5_URL: ${{ secrets.ZEE5_URL }}
 
+          # LIVE Playlist checker envs
           LIVE_INPUT_PATH: ${{ secrets.LIVE_INPUT_PATH }}
           LIVE_OUTPUT_PATH: ${{ secrets.LIVE_OUTPUT_PATH }}
           LIVE_LOG_PATH: ${{ secrets.LIVE_LOG_PATH }}
@@ -109,7 +110,7 @@ jobs:
           echo -e "${GREEN}🕒 Current minute: $MINUTE${NC}"
 
           # -------------------------
-          # Loop through all playlists
+          # Loop through normal playlists
           while IFS='|' read -r NAME INPUT_SECRET OUTPUT_SECRET URL_SECRET INTERVAL; do
             [[ -z "$NAME" ]] && continue
             [[ -z "$INTERVAL" ]] && INTERVAL=0
@@ -143,27 +144,30 @@ jobs:
           done <<< "$PLAYLISTS"
 
           # -------------------------
-          # Run LIVE Playlist Checker safely
+          # Run LIVE Checker
           echo -e "${GREEN}🔍 Running LIVE Playlist Checker...${NC}"
           if ! python scripts/check_playlist.py; then
             echo -e "${RED}⚠ LIVE Playlist Checker failed, skipping.${NC}"
           fi
 
-          if [[ -f "$LIVE_OUTPUT_PATH" ]]; then
-            git add "$LIVE_OUTPUT_PATH"
+          # -------------------------
+          # Folder-based LIVE output detection
+          if [[ -d "$LIVE_OUTPUT_PATH" ]]; then
+            git add "$LIVE_OUTPUT_PATH"/*.m3u "$LIVE_OUTPUT_PATH"/*.m3u8 2>/dev/null || true
+
             if ! git diff --cached --quiet "$LIVE_OUTPUT_PATH"; then
-              CHANGED_PLAYLISTS+=("LIVE_PLAYLIST")
-              echo -e "${GREEN}✅ LIVE playlist updated.${NC}"
+              CHANGED_PLAYLISTS+=("LIVE")
+              echo -e "${GREEN}✅ LIVE playlist folder updated.${NC}"
             else
               echo -e "${YELLOW}⚪ LIVE playlist unchanged.${NC}"
               git restore --staged "$LIVE_OUTPUT_PATH" || true
             fi
           else
-            echo -e "${RED}⚠ LIVE output file does not exist: $LIVE_OUTPUT_PATH${NC}"
+            echo -e "${RED}⚠ LIVE output folder does not exist: $LIVE_OUTPUT_PATH${NC}"
           fi
 
           # -------------------------
-          # Commit & push changes (skip pull/rebase to avoid unstaged errors)
+          # Commit & push
           if [ ${#CHANGED_PLAYLISTS[@]} -ne 0 ]; then
             git commit -m "🔄 Auto-update playlists: ${CHANGED_PLAYLISTS[*]}" || echo "No changes to commit"
             git push origin main
