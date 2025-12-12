@@ -1,0 +1,184 @@
+name: tvguide
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */4 * * *"
+    - cron: "00 22 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tiviguide-main
+  cancel-in-progress: true
+
+jobs:
+  run-tiviguide:
+    runs-on: ubuntu-latest
+    env:
+      EPG_REPO_NAME: ${{ secrets.EPG_REPO_NAME }}
+      EPG_REPO_PAT: ${{ secrets.EPG_REPO_PAT }}
+      EPG_JIO_URL: ${{ secrets.EPG_JIO_URL }}
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout private EPG repo (quiet)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.EPG_REPO_NAME }}
+          ref: main
+          token: ${{ env.EPG_REPO_PAT }}
+          path: epg-repo
+
+      - name: Configure Git (repo-local, quiet)
+        run: |
+          # use repo-local config (do NOT use --global in CI)
+          git -C epg-repo config user.email "192395417+senvora@users.noreply.github.com"
+          git -C epg-repo config user.name "senvora"
+
+      - name: Setup Node.js (quiet)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Python (quiet)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Setup PHP (quiet)
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: 8.4
+          extensions: xml, imagick, zip, curl
+
+      - name: Install 7-Zip (quiet)
+        run: sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq p7zip-full >/dev/null 2>&1
+
+      - name: Install Node.js dependencies (silent)
+        working-directory: epg-repo
+        run: |
+          mkdir -p logs
+          npm install --legacy-peer-deps >logs/npm.log 2>&1 || {
+            echo "❌ npm install failed"; tail -n 200 logs/npm.log; exit 1;
+          }
+          echo "✔ npm install completed." >/dev/null
+
+      - name: Install Python dependencies (silent)
+        working-directory: epg-repo
+        run: |
+          mkdir -p logs
+          python3 -m pip install --upgrade pip >/dev/null 2>&1
+          if [ -f requirements.txt ]; then
+            pip install --no-cache-dir -r requirements.txt >logs/pip.log 2>&1 || {
+              echo "❌ pip install failed"; tail -n 200 logs/pip.log; exit 1;
+            }
+          fi
+          echo "✔ pip install completed." >/dev/null
+
+      - name: Grab all EPGs in parallel (silent)
+        working-directory: epg-repo
+        run: |
+          mkdir -p tmp_xml logs
+
+          grab_provider() {
+            provider="$1"
+            base=$(basename "$provider" .xml)
+            out="tmp_xml/${base}.xml"
+            log="logs/grab_${base}.log"
+
+            if [ -f "sites/$provider" ]; then
+              if ! npm run grab -- \
+                --channels="sites/$provider" \
+                --maxConnections=10 \
+                --days=2 \
+                --output="$out" >"$log" 2>&1; then
+                echo "<tv></tv>" > "$out"
+              fi
+            else
+              echo "<tv></tv>" > "$out"
+            fi
+          }
+
+          while read -r p || [[ -n "$p" ]]; do
+            grab_provider "$p" &
+          done < scripts/epg/sites.txt
+          wait
+
+      - name: Merge EPGs (silent)
+        working-directory: epg-repo
+        run: |
+          mkdir -p public/guide logs
+          if ! python3 scripts/epg/epg_grabber.py >logs/merge.log 2>&1; then
+            echo "❌ Merge failed"; tail -n 200 logs/merge.log; exit 1;
+          fi
+          [[ -s public/guide/guide.xml.gz ]] || { echo "❌ Missing guide.xml.gz"; exit 1; }
+
+      ######################################################################
+      #                         FIXED TEMPEST BLOCK (quiet)
+      ######################################################################
+      - name: Tempest PHP grabber (fixed – correct ZIP structure, no password)
+        working-directory: epg-repo
+        run: |
+          set -euo pipefail
+
+          rm -rf temp_epg
+          mkdir -p temp_epg logs
+
+          # extract (suppress output)
+          7z x tempest_epg_grabber.zip -otemp_epg >/dev/null 2>&1
+
+          if [ ! -f temp_epg/tempest.php ]; then
+            echo "❌ tempest.php missing in ZIP"; exit 1;
+          fi
+
+          # run PHP (logs captured)
+          if ! php -d date.timezone=Asia/Kolkata -q temp_epg/tempest.php --epg config=tempest.config.xml >logs/tempest_php.log 2>&1; then
+            echo "❌ Tempest PHP failed"; tail -n 200 logs/tempest_php.log; exit 1;
+          fi
+
+          # run Python (logs captured)
+          if ! python3 scripts/epg/tempest_epg.py >logs/tempest_py.log 2>&1; then
+            echo "❌ Tempest Python failed"; tail -n 200 logs/tempest_py.log; exit 1;
+          fi
+
+          # rebuild ZIP quietly
+          rm -f tempest_epg_grabber.zip
+          cd temp_epg
+          7z a ../tempest_epg_grabber.zip * >/dev/null 2>&1
+          cd ..
+
+          # validate ZIP quietly
+          7z t tempest_epg_grabber.zip >/dev/null 2>&1 || {
+            echo "❌ ZIP validation failed"; exit 1;
+          }
+
+          rm -rf temp_epg
+
+      ######################################################################
+      # VALIDATION BLOCK (quiet)
+      ######################################################################
+      - name: Validate merged outputs (quiet)
+        working-directory: epg-repo
+        run: |
+          for f in public/guide/guide.xml.gz public/guide/epg.xml.gz public/guide/jiotv.xml.gz; do
+            [[ -s "$f" ]] || { echo "❌ Missing or empty: $f"; exit 1; }
+          done
+
+      - name: Commit & Push changes (quiet)
+        working-directory: epg-repo
+        run: |
+          git add public/guide/*.xml.gz tempest_epg_grabber.zip || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to push"
+            exit 0
+          fi
+
+          git -c user.name="senvora" -c user.email="192395417+senvora@users.noreply.github.com" commit -m "📺 Auto-updated EPG (including Tempest ZIP)" || true
+          git pull --rebase origin main >/dev/null 2>&1 || true
+          git push origin main >/dev/null 2>&1
+
+      - name: Done (quiet)
+        run: echo "✔ Workflow completed." >/dev/null

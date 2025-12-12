@@ -1,0 +1,146 @@
+name: automation
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: automation-main
+  cancel-in-progress: true
+
+jobs:
+  run-automation:
+    runs-on: ubuntu-latest
+
+    env:
+      PLAYLISTS: |
+        Fancode|FANCODE_INPUT_PATH|FANCODE_OUTPUT_PATH|FANCODE_URL|15
+        JioCinema|JIOCINEMA_INPUT_PATH|JIOCINEMA_OUTPUT_PATH|JIOCINEMA_URL|15
+        JioTVPlus|JIOTVPLUS_INPUT_PATH|JIOTVPLUS_OUTPUT_PATH|JIOTVPLUS_URL|15
+        SkySport|SKYSPORT_INPUT_PATH|SKYSPORT_OUTPUT_PATH|SKYSPORT_URL|15
+        SonyLIV|SONYLIV_INPUT_PATH|SONYLIV_OUTPUT_PATH|SONYLIV_URL|15
+        Zee5|ZEE5_INPUT_PATH|ZEE5_OUTPUT_PATH|ZEE5_URL|15
+
+    steps:
+      - name: Checkout Private Repo (quiet)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO_NAME }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          fetch-depth: 0
+
+      - name: Configure Git (quiet)
+        run: |
+          git config user.name "senvora" >/dev/null 2>&1
+          git config user.email "192395417+senvora@users.noreply.github.com" >/dev/null 2>&1
+          
+      - name: Setup Python (quiet)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Cache pip (quiet)
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies (quiet)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip >/dev/null 2>&1
+          pip install --no-cache-dir -r requirements.txt >/dev/null 2>&1
+          pip install --no-cache-dir tqdm --upgrade >/dev/null 2>&1
+
+      - name: Verify installed Python packages (quiet)
+        run: pip list >/dev/null 2>&1
+
+      - name: Update Playlists & Run LIVE Playlist Checker (quiet)
+        shell: bash
+        env:
+          FANCODE_INPUT_PATH: ${{ secrets.FANCODE_INPUT_PATH }}
+          FANCODE_OUTPUT_PATH: ${{ secrets.FANCODE_OUTPUT_PATH }}
+          FANCODE_URL: ${{ secrets.FANCODE_URL }}
+
+          JIOCINEMA_INPUT_PATH: ${{ secrets.JIOCINEMA_INPUT_PATH }}
+          JIOCINEMA_OUTPUT_PATH: ${{ secrets.JIOCINEMA_OUTPUT_PATH }}
+          JIOCINEMA_URL: ${{ secrets.JIOCINEMA_URL }}
+
+          JIOTVPLUS_INPUT_PATH: ${{ secrets.JIOTVPLUS_INPUT_PATH }}
+          JIOTVPLUS_OUTPUT_PATH: ${{ secrets.JIOTVPLUS_OUTPUT_PATH }}
+          JIOTVPLUS_URL: ${{ secrets.JIOTVPLUS_URL }}
+
+          SKYSPORT_INPUT_PATH: ${{ secrets.SKYSPORT_INPUT_PATH }}
+          SKYSPORT_OUTPUT_PATH: ${{ secrets.SKYSPORT_OUTPUT_PATH }}
+          SKYSPORT_URL: ${{ secrets.SKYSPORT_URL }}
+
+          SONYLIV_INPUT_PATH: ${{ secrets.SONYLIV_INPUT_PATH }}
+          SONYLIV_OUTPUT_PATH: ${{ secrets.SONYLIV_OUTPUT_PATH }}
+          SONYLIV_URL: ${{ secrets.SONYLIV_URL }}
+
+          ZEE5_INPUT_PATH: ${{ secrets.ZEE5_INPUT_PATH }}
+          ZEE5_OUTPUT_PATH: ${{ secrets.ZEE5_OUTPUT_PATH }}
+          ZEE5_URL: ${{ secrets.ZEE5_URL }}
+
+          LIVE_INPUT_PATH: ${{ secrets.LIVE_INPUT_PATH }}
+          LIVE_OUTPUT_PATH: ${{ secrets.LIVE_OUTPUT_PATH }}
+          LIVE_CSV_PATH: ${{ secrets.LIVE_CSV_PATH }}
+
+        run: |
+          set -euo pipefail
+
+          CHANGED_PLAYLISTS=()
+          MINUTE=$(date +%M)
+
+          # Update ALL normal playlists (suppress script output; check exit status)
+          while IFS='|' read -r NAME INPUT_SECRET OUTPUT_SECRET URL_SECRET INTERVAL; do
+            [[ -z "$NAME" ]] && continue
+            [[ -z "$INTERVAL" ]] && INTERVAL=0
+
+            if (( INTERVAL > 0 && (INTERVAL == 15 || 10#$MINUTE % INTERVAL == 0) )); then
+              if ! python scripts/update_${NAME,,}.py >/dev/null 2>&1; then
+                # failure -> keep step failing, but continue to next playlist
+                echo "ERROR_UPDATING_${NAME}" >/dev/stderr
+                continue
+              fi
+            fi
+
+            # Check for updated files
+            if [[ -n "$OUTPUT_SECRET" ]]; then
+              OUTPUT_PATH="${!OUTPUT_SECRET}"
+
+              if [[ -f "$OUTPUT_PATH" ]]; then
+                git add "$OUTPUT_PATH" >/dev/null 2>&1
+                if ! git diff --cached --quiet "$OUTPUT_PATH"; then
+                  CHANGED_PLAYLISTS+=("$NAME")
+                else
+                  git restore --staged "$OUTPUT_PATH" >/dev/null 2>&1 || true
+                fi
+              fi
+            fi
+
+          done <<< "$PLAYLISTS"
+
+          # RUN LIVE PLAYLIST CHECKER (silent)
+          if ! python scripts/check_playlist.py >/dev/null 2>&1; then
+            echo "ERROR_LIVE_CHECKER" >/dev/stderr
+          fi
+
+          # LIVE folder-based staging (silent)
+          if [[ -d "$LIVE_OUTPUT_PATH" ]]; then
+            git add "$LIVE_OUTPUT_PATH" 2>/dev/null || true
+            if ! git diff --cached --quiet; then
+              CHANGED_PLAYLISTS+=("LIVE")
+            else
+              git restore --staged "$LIVE_OUTPUT_PATH" >/dev/null 2>&1 || true
+            fi
+          fi
+
+          # COMMIT & PUSH (only if changes)
+          if [ ${#CHANGED_PLAYLISTS[@]} -ne 0 ]; then
+            git commit -m "🔄 Auto-update playlists: ${CHANGED_PLAYLISTS[*]}" >/dev/null 2>&1 || true
+            git push --quiet origin main
+          fi

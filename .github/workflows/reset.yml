@@ -1,0 +1,90 @@
+name: reset
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type ERASE to confirm wiping repo completely"
+        required: true
+        default: "NO"
+
+jobs:
+  reset-repo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "ERASE" ]; then
+            echo "⚠️ Confirmation failed. Type ERASE to proceed."
+            exit 1
+          fi
+
+      - name: Checkout repo (quiet)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set Git identity (quiet)
+        run: |
+          git config user.name "senvora" >/dev/null 2>&1
+          git config user.email "192395417+senvora@users.noreply.github.com" >/dev/null 2>&1
+          
+      - name: Delete all remote branches (quiet)
+        run: |
+          set -euo pipefail
+          git fetch --all --quiet >/dev/null 2>&1
+          DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+          for branch in $(git branch -r | grep -vE "origin/($DEFAULT_BRANCH|HEAD)" | sed 's|origin/||' || true); do
+            git push --quiet origin --delete "$branch" >/dev/null 2>&1 || true
+          done
+
+      - name: Delete all tags (quiet)
+        run: |
+          set -euo pipefail
+          git fetch --tags --quiet >/dev/null 2>&1
+          for tag in $(git tag || true); do
+            git push --quiet origin --delete "tag" "$tag" >/dev/null 2>&1 || true
+          done
+
+      - name: Create orphan branch and initial commit (quiet)
+        run: |
+          set -euo pipefail
+          # create orphan branch, allow empty commit so it never fails
+          git checkout --orphan temp-branch >/dev/null 2>&1
+          git reset --hard >/dev/null 2>&1
+          git add -A >/dev/null 2>&1 || true
+          git commit --allow-empty -m "Initial commit" >/dev/null 2>&1
+          DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+          git branch -M "$DEFAULT_BRANCH" >/dev/null 2>&1
+
+      - name: Force push (quiet)
+        run: |
+          set -euo pipefail
+          DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+          git push --force --quiet origin "$DEFAULT_BRANCH" >/dev/null 2>&1
+
+  cleanup-api:
+    runs-on: ubuntu-latest
+    needs: reset-repo
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout repo (quiet)
+        uses: actions/checkout@v4
+
+      - name: Set up Python (quiet)
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies (quiet)
+        run: |
+          python -m pip install --upgrade pip >/dev/null 2>&1
+          pip install requests >/dev/null 2>&1
+
+      - name: Run cleanup script (silent)
+        run: |
+          # run script and hide all output; exit non-zero will still fail the step
+          python scripts/reset.py >/dev/null 2>&1
